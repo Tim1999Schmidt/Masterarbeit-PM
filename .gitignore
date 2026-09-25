@@ -1,0 +1,16 @@
+# STM32 Build-Ordner (Wichtigste Zeile!)
+Debug/
+Release/
+
+# Kompilierte Binär- und Analysedateien
+*.o
+*.elf
+*.bin
+*.hex
+*.map
+*.d
+*.su
+*.list
+
+# IDE-Benutzereinstellungen
+.settings/
