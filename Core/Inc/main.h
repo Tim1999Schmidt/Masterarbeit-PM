@@ -77,10 +77,10 @@ void Error_Handler(void);
 #define SEL1_GPIO_Port GPIOB
 #define SEL2_Pin GPIO_PIN_2
 #define SEL2_GPIO_Port GPIOB
-#define SEL3_Pin GPIO_PIN_8
-#define SEL3_GPIO_Port GPIOA
-#define SEL3B3_Pin GPIO_PIN_3
-#define SEL3B3_GPIO_Port GPIOB
+#define PID_HEATING_Pin GPIO_PIN_8
+#define PID_HEATING_GPIO_Port GPIOA
+#define SEL3_Pin GPIO_PIN_3
+#define SEL3_GPIO_Port GPIOB
 #define SEL4_Pin GPIO_PIN_4
 #define SEL4_GPIO_Port GPIOB
 

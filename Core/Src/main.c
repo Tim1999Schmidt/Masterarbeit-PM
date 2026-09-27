@@ -480,22 +480,22 @@ static void MX_GPIO_Init(void)
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOA, RELAY_SET_Pin|RELAY_RESET_Pin|FAN_CTRL_Pin|PID_COOLING_Pin
-                          |SEL3_Pin, GPIO_PIN_RESET);
+                          |PID_HEATING_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, SEL1_Pin|SEL2_Pin|SEL3B3_Pin|SEL4_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, SEL1_Pin|SEL2_Pin|SEL3_Pin|SEL4_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pins : RELAY_SET_Pin RELAY_RESET_Pin FAN_CTRL_Pin PID_COOLING_Pin
-                           SEL3_Pin */
+                           PID_HEATING_Pin */
   GPIO_InitStruct.Pin = RELAY_SET_Pin|RELAY_RESET_Pin|FAN_CTRL_Pin|PID_COOLING_Pin
-                          |SEL3_Pin;
+                          |PID_HEATING_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : SEL1_Pin SEL2_Pin SEL3B3_Pin SEL4_Pin */
-  GPIO_InitStruct.Pin = SEL1_Pin|SEL2_Pin|SEL3B3_Pin|SEL4_Pin;
+  /*Configure GPIO pins : SEL1_Pin SEL2_Pin SEL3_Pin SEL4_Pin */
+  GPIO_InitStruct.Pin = SEL1_Pin|SEL2_Pin|SEL3_Pin|SEL4_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
