@@ -21,7 +21,10 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "temperature_sensor.h"
+#include "current_sensor.h"
+#include "pid_control.h"
+#include "i2c_comm.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -109,6 +112,11 @@ int main(void)
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
 
+  TempSensor_Init();
+  CurrentSensor_Init();
+  PidControl_Init();
+  I2cComm_Init();
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -118,6 +126,10 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+
+    TempSensor_Process();
+    PidControl_Process();
+    I2cComm_Update();
   }
   /* USER CODE END 3 */
 }
