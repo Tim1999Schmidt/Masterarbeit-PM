@@ -63,7 +63,9 @@ void PidControl_Init(void);
 void PidControl_Process(void);
 
 /* Requests the controller to start / stop regulating. Start triggers the
- * short blocking startup calibration described above. */
+ * short blocking startup calibration described above. A start request is
+ * held back until TempSensor_IsReady() (the temperature front-end calibrates
+ * itself for ~300 ms after boot) and is cancelled by Stop. */
 void PidControl_Start(void);
 void PidControl_Stop(void);
 uint8_t PidControl_IsRunning(void);

@@ -1,29 +1,51 @@
 /**
  ******************************************************************************
  * @file    temperature_sensor.h
- * @brief   Temperature acquisition for up to three PT1000 RTD channels,
- *          multiplexed via SEL1..SEL4 onto the single TEMP (PA1 / ADC1_IN1)
- *          analog input.
+ * @brief   PT1000 temperature measurement of the PM board.
  *
- * Ported from temperature_driver_sw (STM32F401RET6) to the STM32C051K6T6
- * "PM" board. On the old board, resistance was derived from an RC
- * discharge-time measurement (CHARGE/MEASURE MOSFETs + external comparator
- * on the TRIG/EXTI pin). The new board has none of those signals and instead
- * exposes a single dedicated ADC channel (TEMP), so resistance is now
- * derived directly from an ADC reading of a resistor divider that the
- * SELx lines switch between four positions (one internal reference
- * resistor + three real RTD channels) - see the assumption called out in
- * temperature_sensor.c (RatioFromCounts / channel wiring).
+ * Hardware (PM board):
+ *   A constant-current source drives 100 uA through ONE of three resistors,
+ *   selected by the SEL lines. An analog front-end turns the small voltage
+ *   drop into 0 V (PT1000 at 0 degC = 1000 Ohm) ... 3.3 V (70 degC =
+ *   ~1270.75 Ohm), read by ADC1 channel 1 (TEMP, PA1):
  *
- * The piecewise-linear resistance->temperature table and the per-channel
- * calibration (offset/slope) concept are carried over unchanged from the
- * original driver.
+ *      CH1 / SEL1 : PT1000 sensor      - the only channel used in normal operation
+ *      CH2 / SEL2 : 1.27 kOhm resistor - calibration only (top of the range)
+ *      CH3 / SEL3 : 1.00 kOhm resistor - calibration only (bottom of the range)
+ *      SEL4       : unused on this board revision (kept low)
  *
- * Uses float (not double): the STM32C051 (Cortex-M0+) has no FPU
- * (-mfloat-abi=soft), so every floating-point op is software-emulated, and
- * the 64-bit routines for double are considerably larger than the 32-bit
- * ones for float. float's ~7 significant digits are ample for 0.01 degC
- * resolution here.
+ * Measurement: one reading every TEMP_SAMPLE_INTERVAL_MS (100 ms, fixed).
+ * Unlike the original RC-charging method there is nothing to wait for - no
+ * settling time, no filter time, no temporal filter. A reading is a short burst
+ * of ADC conversions on the already-selected CH1, averaged against ADC noise.
+ *
+ * Calibration: the two precision resistors sit exactly at the two ends of the
+ * measuring range, so measuring them gives a 2-point calibration of the whole
+ * analog chain (current source, amplifier gain/offset, ADC offset/gain):
+ *
+ *      R = 1000 Ohm + (counts - counts@1k) * (1270 - 1000) Ohm / (counts@1.27k - counts@1k)
+ *
+ * The PT1000 resistance is then converted to degC with a piecewise-linear
+ * table in 10 K steps (values from the PT1000 sensor data sheet, see
+ * temperature_sensor.c). The calibration runs on the
+ * same fixed 100 ms clock, right after TempSensor_Init() and on request
+ * (TempSensor_Recalibrate()):
+ *
+ *      tick 0: connect the 1.00 kOhm reference (done in Init / on request)
+ *      tick 1: measure it,            connect the 1.27 kOhm reference
+ *      tick 2: measure it, calibrate, connect the PT1000 again
+ *      tick 3: first PT1000 reading -> TempSensor_IsReady() = 1
+ *
+ * So a calibration takes ~300 ms. (The one interval between connecting a
+ * reference and measuring it is just a consequence of the fixed clock, not a
+ * separate settling timer.)
+ *
+ * Measuring range: 0 ... ~70 degC. Beyond that the front-end output saturates
+ * at 0 V / 3.3 V and the reading is no longer valid (see the note in
+ * temperature_sensor.c).
+ *
+ * Cooperative: call TempSensor_Process() once per main loop iteration. A tick
+ * blocks for the ADC burst only (~1-2 ms; ~5-8 ms for a calibration reading).
  ******************************************************************************
  */
 #ifndef TEMPERATURE_SENSOR_H
@@ -36,66 +58,49 @@
 extern "C" {
 #endif
 
-/* Three real RTD channels are exposed (SEL2..SEL4 in the original driver's
- * numbering). SEL1 is reserved internally as the fixed calibration resistor
- * position, exactly as in the original driver, and is not exposed here. */
+/* Where the temperature that the PID controller regulates on comes from. */
 typedef enum
 {
-    TEMP_CHANNEL_1 = 0,
-    TEMP_CHANNEL_2,
-    TEMP_CHANNEL_3,
-    TEMP_CHANNEL_COUNT
-} TempSensor_Channel_t;
-
-/* Selects which temperature value is handed to the PID controller. */
-typedef enum
-{
-    TEMP_SOURCE_EXTERNAL = 0,  /* Use value written via TempSensor_SetExternalTemperature() */
-    TEMP_SOURCE_CH1      = 1,
-    TEMP_SOURCE_CH2      = 2,
-    TEMP_SOURCE_CH3      = 3
+    TEMP_SOURCE_EXTERNAL = 0,  /* value supplied by the I2C master (TempSensor_SetExternalTemperature) */
+    TEMP_SOURCE_INTERNAL = 1   /* the PT1000 on CH1 */
 } TempSensor_Source_t;
 
-/* One-time setup: zeroes filter memory, builds the PWL table, precalculates
- * derived constants, sets GPIO mux lines to a defined idle state. Call once
- * from main() before the main loop. */
+/* One-time setup; starts the calibration sequence. Call from main() before the main loop. */
 void TempSensor_Init(void);
 
-/* Cooperative, non-blocking state machine step. Call once per main loop
- * iteration. Internally cycles through: select channel -> let the analog
- * mux/filter settle -> read & convert -> advance to next channel. One full
- * pass over all four mux positions (reference + 3 channels) takes a few
- * milliseconds; this is comfortably fast compared to the thermal time
- * constants of a Peltier-regulated setup. */
+/* Fixed-interval measurement / calibration state machine. Call every main loop iteration. */
 void TempSensor_Process(void);
 
-/* Calibrated temperature of a single channel, in degrees Celsius. Returns
- * the most recent measurement; updated once per completed scan of that
- * channel. */
-float TempSensor_GetTemperature(TempSensor_Channel_t channel);
+/* Requests a new 2-point calibration (starts at the next 100 ms tick, takes ~300 ms,
+ * during which the last temperature value is held). Only do this while the
+ * controller is not regulating - i2c_comm.c enforces that. */
+void TempSensor_Recalibrate(void);
 
-/* Raw (uncalibrated) resistance of a single channel in Ohms, mainly useful
- * for debugging/verifying the analog front-end assumption. */
-float TempSensor_GetResistance(TempSensor_Channel_t channel);
+/* 1 once the temperature the controller uses is valid: with the internal
+ * source that means "calibration succeeded and a first PT1000 value exists";
+ * with the external source it is always 1. */
+uint8_t TempSensor_IsReady(void);
 
-/* Temperature currently selected to drive the PID controller (either one of
- * the three channels or the externally-supplied value). This is the
- * pointer-equivalent of the original T_CTRL. */
+/* PT1000 (CH1) results. */
+float TempSensor_GetTemperature(void);   /* degC, including the optional trim */
+float TempSensor_GetResistance(void);    /* Ohm */
+
+/* Temperature the PID controller regulates on (internal PT1000 or external value, see above). */
 float TempSensor_GetControlTemperature(void);
-
-/* Selects which source feeds the PID controller. */
-void TempSensor_SetSource(TempSensor_Source_t source);
+void  TempSensor_SetSource(TempSensor_Source_t source);
 TempSensor_Source_t TempSensor_GetSource(void);
+void  TempSensor_SetExternalTemperature(float tempDegC);
 
-/* Supplies an externally-provided temperature value (e.g. received from the
- * I2C master) to be used when the source is TEMP_SOURCE_EXTERNAL. */
-void TempSensor_SetExternalTemperature(float tExtDegC);
+/* Optional final trim against a reference thermometer (e.g. to remove the
+ * PT1000's own tolerance): T = Traw - offsetDegC - Traw * slope. Default 0 / 0.
+ * (Not to be confused with the automatic resistor calibration above.) */
+void TempSensor_SetTrim(float offsetDegC, float slope);
 
-/* Per-channel linear calibration: T_calibrated = T_raw - offset - T_raw*slope
- * (same convention as the original driver). Defaults to 0/0 (uncalibrated)
- * since these are per-physical-unit values tied to the old board and must be
- * re-derived for each new PM board - see temperature_sensor.c. */
-void TempSensor_SetCalibration(TempSensor_Channel_t channel, float offset, float slope);
+/* Raw ADC counts (0..4095) measured on the two calibration resistors during
+ * the last calibration - for bring-up diagnostics. Expected with the nominal
+ * front-end (0 V at 1000 Ohm, 3.3 V at ~1270.75 Ohm): about 0 and about 4084. */
+uint16_t TempSensor_GetCalCountsLow(void);   /* 1.00 kOhm reference (CH3) */
+uint16_t TempSensor_GetCalCountsHigh(void);  /* 1.27 kOhm reference (CH2) */
 
 #ifdef __cplusplus
 }

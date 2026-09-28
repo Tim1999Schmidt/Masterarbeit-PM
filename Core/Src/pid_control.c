@@ -393,7 +393,10 @@ static void PidStep(void)
         PushErrHistory();
         err = T_SET - TempSensor_GetControlTemperature();
 
-        if (startRequested)
+        /* A start request waits until the temperature measurement is valid
+         * (calibration of the analog front-end right after boot takes ~300 ms),
+         * so errStart / the sanity check are never based on a bogus 0 degC. */
+        if (startRequested && TempSensor_IsReady())
         {
             startRequested = 0;
             errStart = err;
@@ -463,10 +466,15 @@ static void PidStep(void)
         break;
     }
 
-    if (stopRequested && pidState != PID_STATE_OFF && pidState != PID_STATE_ERROR)
+    if (stopRequested)
     {
-        driverStopRequested = 1;
-        pidState = PID_STATE_OFF;
+        startRequested = 0; /* also cancels a start that is still waiting for a valid temperature */
+
+        if (pidState != PID_STATE_OFF && pidState != PID_STATE_ERROR)
+        {
+            driverStopRequested = 1;
+            pidState = PID_STATE_OFF;
+        }
     }
     stopRequested = 0;
 }

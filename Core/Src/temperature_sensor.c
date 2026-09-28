@@ -3,151 +3,136 @@
  * @file    temperature_sensor.c
  * @brief   See temperature_sensor.h.
  *
- * ASSUMPTION TO VERIFY AGAINST THE PM SCHEMATIC
- * -----------------------------------------------
- * The original board measured resistance via an RC discharge time (CHARGE /
- * MEASURE MOSFETs + external comparator on a TRIG/EXTI pin). None of those
- * signals exist on the PM board's IOC - instead there is a single ADC input
- * (TEMP, PA1). This file assumes SEL1..SEL4 now switch a resistor divider of
- * the form
- *
- *      VDDA --[[ R_fixed (shared, same for all 4 mux positions) ]]-- TEMP(ADC) --[[ R_selected ]]-- GND
- *
- * i.e. the selected resistor (calibration resistor on SEL1, RTD sensors on
- * SEL2..SEL4) sits on the GND side. Because R_fixed is identical for all four
- * mux positions, it cancels out when a channel's reading is taken *relative*
- * to the SEL1 reference reading - exactly like fclk/c_Meas cancelled out in
- * the original RC-timing formula - so its absolute value does not need to be
- * known. What DOES need to be verified is the side of the divider: if the
- * selected resistor is actually on the VDDA side instead, invert the ratio
- * in RatioFromCounts() (swap `counts` and `ADC_FULL_SCALE - counts`).
- *
- * R_CAL_OHM (the SEL1 reference resistor) is carried over unchanged from the
- * original driver (1000 Ohm nominal).
+ * Note on the measuring range: the front-end maps 0 degC -> 0 V and 70 degC ->
+ * 3.3 V. Below 0 degC / above ~70 degC the output saturates (and a broken
+ * PT1000 lead makes the constant-current source drive the output to the top
+ * rail, i.e. it looks like "70 degC"). This module does not (yet) flag such
+ * readings; a plausibility check on the raw counts would be the place for it.
  ******************************************************************************
  */
 #include "temperature_sensor.h"
-#include <string.h>
+#include "adc_reader.h"
 
-extern ADC_HandleTypeDef hadc1; /* initialised by MX_ADC1_Init() in main.c, shared with current_sensor.c */
+/* ---- Front-end description (PM board) ---------------------------------- */
+#define ADC_MAX_COUNTS            4095.0f
+#define R_CAL_LOW_OHM             1000.0f   /* CH3 / SEL3: bottom-of-range reference resistor */
+#define R_CAL_HIGH_OHM            1270.0f   /* CH2 / SEL2: top-of-range reference resistor    */
 
-/* ---- Tunables --------------------------------------------------------- */
-#define ADC_FULL_SCALE          4096.0f  /* 12-bit ADC1, matches old board's resolution */
-#define R_CAL_OHM                1000.0f  /* SEL1 reference resistor, same nominal value as original driver */
-#define TEMP_MUX_SETTLE_MS          2u   /* wait after switching SELx before reading TEMP; original RC design settled within ~100us, 2ms leaves generous margin for the new analog mux + any anti-alias filter */
+/* Nominal front-end, used until the first calibration has succeeded:
+ * 0 V (0 counts) <-> PT1000 at 0 degC, 3.3 V (full scale) <-> PT1000 at 70 degC (IEC 60751). */
+#define R_NOMINAL_AT_0_COUNTS     1000.0f
+#define R_NOMINAL_AT_FULLSCALE    1270.75f
+#define R_PT1000_AT_0C            1000.0f
 
-#define MEDIAN_MEMSIZE               7u   /* odd number of scan rounds kept per channel, same as original driver */
-#define MEDIAN_AVG_SIDES             2u   /* neighbours averaged on each side of the median, same as original driver */
+/* ---- Tunables ----------------------------------------------------------- */
+#define TEMP_SAMPLE_INTERVAL_MS   100u     /* fixed measurement interval (same as the PID cycle) */
+#define TEMP_OVERSAMPLE            16u     /* ADC conversions averaged per reading (one short burst) */
+#define CAL_OVERSAMPLE             64u     /* ADC conversions averaged per calibration resistor      */
+#define CAL_MIN_SPAN_COUNTS      1000.0f   /* plausibility: counts(1.27k) - counts(1k) must be at least this (nominal ~4084) */
+
+/* ReadAveragedCounts() drops the highest and the lowest sample, so it needs at least 3.
+ * (Preprocessor check instead of C11 _Static_assert: the CubeIDE editor's parser flags
+ * _Static_assert as a syntax error, while gcc accepts both.) */
+#if (TEMP_OVERSAMPLE < 3u) || (CAL_OVERSAMPLE < 3u)
+#error "TEMP_OVERSAMPLE and CAL_OVERSAMPLE must be at least 3 (ReadAveragedCounts drops min and max)"
+#endif
 
 /* Piecewise-linear resistance/temperature table, carried over verbatim from
- * temperature_driver_sw (datasheet values for NB-PTCO-164 PTFC102A1A0). */
+ * temperature_driver_sw (values calculated from the datasheet formula for
+ * NB-PTCO-164 PTFC102A1A0; these are samples of the standard PT1000 curve,
+ * IEC 60751). Against that formula the table stays within ~0.007 K over
+ * 0..70 degC (checked) - far below one ADC step (0.017 K). */
 #define PWL_SIZE 10u
 static const float pwlResistanceOhm[PWL_SIZE] = { 900.0f, 950.0f, 1000.0f, 1050.0f, 1100.0f, 1150.0f, 1200.0f, 1250.0f, 1300.0f, 1350.0f };
 static const float pwlTemperatureC[PWL_SIZE]  = { -25.488f, -12.7685f, 0.0f, 12.818f, 25.6845f, 38.6005f, 51.5665f, 64.583f, 77.651f, 90.7705f };
-static float pwlSlope[PWL_SIZE];
-static const float linpolSlopeFallback = 0.2593035671f; /* used only outside the PWL-covered range */
+static float pwlSlope[PWL_SIZE - 1u];   /* degC per Ohm of each table segment */
+static const float linpolSlopeFallback = 0.2593035671f; /* used only outside the table (-25..91 degC), where the front-end cannot measure anyway */
 
-/* ---- Median/average filter, one instance per mux position (0=reference) */
-typedef struct
-{
-    uint32_t history[MEDIAN_MEMSIZE];
-    uint32_t sorted[MEDIAN_MEMSIZE];
-    float    filtered;
-} MedianFilter_t;
-
-static MedianFilter_t filters[4];
-static uint8_t scanRoundIndex = 0;
-
-static void MedianFilter_Push(MedianFilter_t *f, uint32_t value, uint8_t writeIndex)
-{
-    int i, j;
-    uint32_t tmp;
-    const uint8_t mid = (MEDIAN_MEMSIZE - 1u) / 2u;
-    float sum;
-
-    f->history[writeIndex] = value;
-    memcpy(f->sorted, f->history, sizeof(f->sorted));
-
-    /* insertion sort - fine for MEDIAN_MEMSIZE this small */
-    for (i = 1; i < (int)MEDIAN_MEMSIZE; i++)
-    {
-        tmp = f->sorted[i];
-        j = i - 1;
-        while (j >= 0 && f->sorted[j] > tmp)
-        {
-            f->sorted[j + 1] = f->sorted[j];
-            j--;
-        }
-        f->sorted[j + 1] = tmp;
-    }
-
-    sum = (float)f->sorted[mid];
-    for (i = 1; i <= (int)MEDIAN_AVG_SIDES; i++)
-    {
-        sum += (float)f->sorted[mid + i];
-        sum += (float)f->sorted[mid - i];
-    }
-    f->filtered = sum / ((MEDIAN_AVG_SIDES * 2.0f) + 1.0f);
-}
-
-/* ---- Module state ------------------------------------------------------ */
+/* ---- SEL multiplexer ---------------------------------------------------- */
 typedef enum
 {
-    TEMP_STATE_SETUP_CHANNEL = 0,
-    TEMP_STATE_SETTLE,
-    TEMP_STATE_READ
-} TempMeasState_t;
+    MUX_PT1000 = 0,   /* CH1 / SEL1 */
+    MUX_CAL_HIGH,     /* CH2 / SEL2, 1.27 kOhm */
+    MUX_CAL_LOW       /* CH3 / SEL3, 1.00 kOhm */
+} MuxChannel_t;
 
-static TempMeasState_t measState = TEMP_STATE_SETUP_CHANNEL;
-static uint8_t activePosition = 0; /* 0 = SEL1 reference, 1..3 = TEMP_CHANNEL_1..3 */
-static uint32_t settleStartTick = 0;
+static void SelectChannel(MuxChannel_t channel)
+{
+    /* Break-before-make: switch everything off first, so two resistors are
+     * never connected to the current source at the same time. */
+    HAL_GPIO_WritePin(SEL1_GPIO_Port, SEL1_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(SEL2_GPIO_Port, SEL2_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(SEL3_GPIO_Port, SEL3_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(SEL4_GPIO_Port, SEL4_Pin, GPIO_PIN_RESET); /* unused on this board revision */
 
-static float resistanceOhm[TEMP_CHANNEL_COUNT];
-static float temperatureRawC[TEMP_CHANNEL_COUNT];
-static float temperatureCalC[TEMP_CHANNEL_COUNT];
-static float calOffset[TEMP_CHANNEL_COUNT];
-static float calSlope[TEMP_CHANNEL_COUNT];
+    switch (channel)
+    {
+    case MUX_PT1000:   HAL_GPIO_WritePin(SEL1_GPIO_Port, SEL1_Pin, GPIO_PIN_SET); break;
+    case MUX_CAL_HIGH: HAL_GPIO_WritePin(SEL2_GPIO_Port, SEL2_Pin, GPIO_PIN_SET); break;
+    case MUX_CAL_LOW:  HAL_GPIO_WritePin(SEL3_GPIO_Port, SEL3_Pin, GPIO_PIN_SET); break;
+    default: break;
+    }
+}
 
-static TempSensor_Source_t controlSource = TEMP_SOURCE_CH1;
+/* Mean of n consecutive ADC conversions of the TEMP channel. The single
+ * highest and lowest value are dropped as outliers (same idea as in
+ * current_sensor.c). */
+static float ReadAveragedCounts(uint32_t n)
+{
+    uint32_t sum  = 0u;
+    uint32_t minV = 0xFFFFFFFFu;
+    uint32_t maxV = 0u;
+    uint32_t i;
+
+    for (i = 0u; i < n; i++)
+    {
+        const uint32_t v = AdcReader_ReadBlocking(ADC_READER_CH_TEMP);
+        sum += v;
+        if (v < minV) minV = v;
+        if (v > maxV) maxV = v;
+    }
+
+    return (float)(sum - minV - maxV) / (float)(n - 2u);
+}
+
+/* ---- State ---------------------------------------------------------------- */
+typedef enum
+{
+    TS_CAL_MEASURE_LOW = 0, /* 1.00 kOhm reference is connected: measure it, connect the 1.27 kOhm one */
+    TS_CAL_MEASURE_HIGH,    /* 1.27 kOhm reference is connected: measure it, calibrate, connect the PT1000 */
+    TS_RUN                  /* normal operation: PT1000 only */
+} TempState_t;
+
+static TempState_t state    = TS_CAL_MEASURE_LOW;
+static uint32_t    lastTick = 0u;
+
+static uint8_t recalRequested   = 0u;
+static uint8_t calibrationOk    = 0u;
+static uint8_t measurementValid = 0u;
+
+/* Raw counts measured on the two calibration resistors (diagnostics). */
+static float calCountsLow  = 0.0f;
+static float calCountsHigh = 0.0f;
+
+/* Active counts -> resistance mapping: two known points on a straight line. */
+static float mapCountsLow   = 0.0f;
+static float mapResLow      = R_NOMINAL_AT_0_COUNTS;
+static float mapOhmPerCount = (R_NOMINAL_AT_FULLSCALE - R_NOMINAL_AT_0_COUNTS) / ADC_MAX_COUNTS;
+
+static float resistanceOhm    = R_PT1000_AT_0C;
+static float temperatureRawC  = 0.0f;
+static float temperatureC     = 0.0f;
+static float trimOffsetC      = 0.0f;
+static float trimSlope        = 0.0f;
+
+static TempSensor_Source_t controlSource = TEMP_SOURCE_INTERNAL;
 static float externalTemperatureC = 0.0f;
 
-/* ---- Helpers ------------------------------------------------------------ */
-static void SelectMuxPosition(uint8_t position)
+static void SetMapping(float countsLow, float countsHigh, float resLowOhm, float resHighOhm)
 {
-    /* Exactly one SELx line active at a time, same convention as the original driver */
-    HAL_GPIO_WritePin(SEL1_GPIO_Port, SEL1_Pin, (position == 0) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(SEL2_GPIO_Port, SEL2_Pin, (position == 1) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(SEL3_GPIO_Port, SEL3_Pin, (position == 2) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(SEL4_GPIO_Port, SEL4_Pin, (position == 3) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-}
-
-static uint32_t ReadTempAdcBlocking(void)
-{
-    ADC_ChannelConfTypeDef sConfig = {0};
-
-    sConfig.Channel = ADC_CHANNEL_1; /* TEMP / PA1 */
-    sConfig.Rank = ADC_RANK_CHANNEL_NUMBER;
-    HAL_ADC_ConfigChannel(&hadc1, &sConfig); /* explicit re-select before every conversion: robust regardless of the sequencer's NbrOfConversion setting */
-
-    HAL_ADC_Start(&hadc1);
-    HAL_ADC_PollForConversion(&hadc1, HAL_MAX_DELAY);
-    uint32_t value = HAL_ADC_GetValue(&hadc1);
-    HAL_ADC_Stop(&hadc1);
-
-    return value;
-}
-
-/* See the file header for the assumption this formula encodes; flip the
- * ratio (swap counts and ADC_FULL_SCALE-counts) if the sensor turns out to
- * sit on the VDDA side instead of the GND side of the divider. */
-static float RatioFromCounts(float counts)
-{
-    if (counts < 1.0f)
-        counts = 1.0f;
-    if (counts > (ADC_FULL_SCALE - 1.0f))
-        counts = ADC_FULL_SCALE - 1.0f;
-
-    return counts / (ADC_FULL_SCALE - counts);
+    mapCountsLow   = countsLow;
+    mapResLow      = resLowOhm;
+    mapOhmPerCount = (resHighOhm - resLowOhm) / (countsHigh - countsLow);
 }
 
 static float ResistanceToTemperature(float resistanceOhmValue)
@@ -164,8 +149,43 @@ static float ResistanceToTemperature(float resistanceOhmValue)
         return pwlTemperatureC[i] + (resistanceOhmValue - pwlResistanceOhm[i]) * pwlSlope[i];
     }
 
-    /* Outside the characterised range: fall back to a simple linear approximation around R_CAL_OHM */
-    return (resistanceOhmValue - R_CAL_OHM) * linpolSlopeFallback;
+    /* Outside the characterised range: fall back to a simple linear approximation around 0 degC */
+    return (resistanceOhmValue - R_PT1000_AT_0C) * linpolSlopeFallback;
+}
+
+/* Connects the 1.00 kOhm reference; the state machine takes it from there. */
+static void BeginCalibration(void)
+{
+    calibrationOk    = 0u;
+    measurementValid = 0u;
+    SelectChannel(MUX_CAL_LOW);
+    state = TS_CAL_MEASURE_LOW;
+}
+
+static void FinishCalibration(void)
+{
+    if ((calCountsHigh - calCountsLow) >= CAL_MIN_SPAN_COUNTS)
+    {
+        SetMapping(calCountsLow, calCountsHigh, R_CAL_LOW_OHM, R_CAL_HIGH_OHM);
+        calibrationOk = 1u;
+    }
+    else
+    {
+        /* Reference readings implausible (resistors not connected / SEL lines not
+         * wired / front-end dead): keep the previous mapping, but do not report ready. */
+        calibrationOk = 0u;
+    }
+}
+
+/* One PT1000 reading: counts -> resistance -> temperature (+ trim). */
+static void MeasurePt1000(void)
+{
+    const float counts = ReadAveragedCounts(TEMP_OVERSAMPLE);
+
+    resistanceOhm   = mapResLow + (counts - mapCountsLow) * mapOhmPerCount;
+    temperatureRawC = ResistanceToTemperature(resistanceOhm);
+    temperatureC    = temperatureRawC - trimOffsetC - (temperatureRawC * trimSlope);
+    measurementValid = 1u;
 }
 
 /* ---- Public API ---------------------------------------------------------- */
@@ -173,100 +193,84 @@ void TempSensor_Init(void)
 {
     uint8_t i;
 
-    memset(filters, 0, sizeof(filters));
-    scanRoundIndex = 0;
-    activePosition = 0;
-    measState = TEMP_STATE_SETUP_CHANNEL;
-
-    for (i = 0; i < TEMP_CHANNEL_COUNT; i++)
-    {
-        resistanceOhm[i] = R_CAL_OHM;
-        temperatureRawC[i] = 0.0f;
-        temperatureCalC[i] = 0.0f;
-        /* Per-unit calibration (offset/slope) is tied to one specific physical
-         * board's component tolerances. The original driver carried a
-         * hand-picked set ("System 003") for the OLD board; since PM is a
-         * different physical unit it needs its own calibration run, so this
-         * starts uncalibrated (0/0) rather than reusing stale values. */
-        calOffset[i] = 0.0f;
-        calSlope[i] = 0.0f;
-    }
-
-    /* Precalculate PWL segment slopes (verbatim from the original driver) */
+    /* Precalculate the PWL segment slopes */
     for (i = 0; i < PWL_SIZE - 1u; i++)
         pwlSlope[i] = (pwlTemperatureC[i + 1] - pwlTemperatureC[i]) / (pwlResistanceOhm[i + 1] - pwlResistanceOhm[i]);
-    /* last slope is extrapolated, uppermost reference point has no upper neighbour */
-    pwlSlope[PWL_SIZE - 1u] = 1.00398f * pwlSlope[PWL_SIZE - 2u];
 
-    SelectMuxPosition(0);
+    SetMapping(0.0f, ADC_MAX_COUNTS, R_NOMINAL_AT_0_COUNTS, R_NOMINAL_AT_FULLSCALE);
+    recalRequested = 0u;
+
+    BeginCalibration();          /* calibrate first, then measure */
+    lastTick = HAL_GetTick();
 }
 
 void TempSensor_Process(void)
 {
-    switch (measState)
+    const uint32_t now = HAL_GetTick();
+
+    if ((now - lastTick) < TEMP_SAMPLE_INTERVAL_MS)
+        return;
+    lastTick = now;
+
+    switch (state)
     {
-    case TEMP_STATE_SETUP_CHANNEL:
-        SelectMuxPosition(activePosition);
-        settleStartTick = HAL_GetTick();
-        measState = TEMP_STATE_SETTLE;
+    case TS_CAL_MEASURE_LOW:
+        calCountsLow = ReadAveragedCounts(CAL_OVERSAMPLE);
+        SelectChannel(MUX_CAL_HIGH);
+        state = TS_CAL_MEASURE_HIGH;
         break;
 
-    case TEMP_STATE_SETTLE:
-        if ((HAL_GetTick() - settleStartTick) >= TEMP_MUX_SETTLE_MS)
-            measState = TEMP_STATE_READ;
+    case TS_CAL_MEASURE_HIGH:
+        calCountsHigh = ReadAveragedCounts(CAL_OVERSAMPLE);
+        FinishCalibration();
+        SelectChannel(MUX_PT1000);
+        state = TS_RUN;
         break;
 
-    case TEMP_STATE_READ:
-    {
-        uint32_t counts = ReadTempAdcBlocking();
-        MedianFilter_Push(&filters[activePosition], counts, scanRoundIndex);
-
-        if (activePosition > 0)
+    case TS_RUN:
+        if (recalRequested)
         {
-            uint8_t ch = activePosition - 1u; /* 0..2 */
-            float ratioRef = RatioFromCounts(filters[0].filtered);
-            float ratioCh = RatioFromCounts(filters[activePosition].filtered);
-
-            resistanceOhm[ch] = R_CAL_OHM * (ratioCh / ratioRef);
-            temperatureRawC[ch] = ResistanceToTemperature(resistanceOhm[ch]);
-            temperatureCalC[ch] = temperatureRawC[ch] - calOffset[ch] - temperatureRawC[ch] * calSlope[ch];
+            recalRequested = 0u;
+            BeginCalibration();
         }
+        else
+        {
+            MeasurePt1000();
+        }
+        break;
 
-        activePosition = (uint8_t)((activePosition + 1u) % 4u);
-        if (activePosition == 0)
-            scanRoundIndex = (uint8_t)((scanRoundIndex + 1u) % MEDIAN_MEMSIZE);
-
-        measState = TEMP_STATE_SETUP_CHANNEL;
+    default:
+        BeginCalibration();
         break;
     }
-    }
 }
 
-float TempSensor_GetTemperature(TempSensor_Channel_t channel)
+void TempSensor_Recalibrate(void)
 {
-    if (channel >= TEMP_CHANNEL_COUNT)
-        return 0.0f;
-    return temperatureCalC[channel];
+    recalRequested = 1u;
 }
 
-float TempSensor_GetResistance(TempSensor_Channel_t channel)
+uint8_t TempSensor_IsReady(void)
 {
-    if (channel >= TEMP_CHANNEL_COUNT)
-        return 0.0f;
-    return resistanceOhm[channel];
+    if (controlSource == TEMP_SOURCE_EXTERNAL)
+        return 1u;
+
+    return (calibrationOk && measurementValid) ? 1u : 0u;
+}
+
+float TempSensor_GetTemperature(void)
+{
+    return temperatureC;
+}
+
+float TempSensor_GetResistance(void)
+{
+    return resistanceOhm;
 }
 
 float TempSensor_GetControlTemperature(void)
 {
-    switch (controlSource)
-    {
-    case TEMP_SOURCE_CH1: return temperatureCalC[TEMP_CHANNEL_1];
-    case TEMP_SOURCE_CH2: return temperatureCalC[TEMP_CHANNEL_2];
-    case TEMP_SOURCE_CH3: return temperatureCalC[TEMP_CHANNEL_3];
-    case TEMP_SOURCE_EXTERNAL:
-    default:
-        return externalTemperatureC;
-    }
+    return (controlSource == TEMP_SOURCE_EXTERNAL) ? externalTemperatureC : temperatureC;
 }
 
 void TempSensor_SetSource(TempSensor_Source_t source)
@@ -279,15 +283,23 @@ TempSensor_Source_t TempSensor_GetSource(void)
     return controlSource;
 }
 
-void TempSensor_SetExternalTemperature(float tExtDegC)
+void TempSensor_SetExternalTemperature(float tempDegC)
 {
-    externalTemperatureC = tExtDegC;
+    externalTemperatureC = tempDegC;
 }
 
-void TempSensor_SetCalibration(TempSensor_Channel_t channel, float offset, float slope)
+void TempSensor_SetTrim(float offsetDegC, float slope)
 {
-    if (channel >= TEMP_CHANNEL_COUNT)
-        return;
-    calOffset[channel] = offset;
-    calSlope[channel] = slope;
+    trimOffsetC = offsetDegC;
+    trimSlope   = slope;
+}
+
+uint16_t TempSensor_GetCalCountsLow(void)
+{
+    return (uint16_t)(calCountsLow + 0.5f);
+}
+
+uint16_t TempSensor_GetCalCountsHigh(void)
+{
+    return (uint16_t)(calCountsHigh + 0.5f);
 }

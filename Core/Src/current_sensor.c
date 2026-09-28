@@ -5,8 +5,7 @@
  ******************************************************************************
  */
 #include "current_sensor.h"
-
-extern ADC_HandleTypeDef hadc1; /* initialised by MX_ADC1_Init() in main.c, shared with temperature_sensor.c */
+#include "adc_reader.h"
 
 /* ---- Tunables, carried over from the original driver ------------------- */
 #define ADC_FULL_SCALE       4096.0f  /* 12-bit ADC1 */
@@ -16,22 +15,6 @@ extern ADC_HandleTypeDef hadc1; /* initialised by MX_ADC1_Init() in main.c, shar
 #define OVERSAMPLE_COUNT           8u   /* same oversampling factor as the original driver's readADC() */
 
 static uint32_t zeroCounts = 0;
-
-static uint32_t ReadCurrentAdcBlocking(void)
-{
-    ADC_ChannelConfTypeDef sConfig = {0};
-
-    sConfig.Channel = ADC_CHANNEL_2; /* I_SENS_FILT / PA2 */
-    sConfig.Rank = ADC_RANK_CHANNEL_NUMBER;
-    HAL_ADC_ConfigChannel(&hadc1, &sConfig); /* explicit re-select before every conversion: robust regardless of the sequencer's NbrOfConversion setting */
-
-    HAL_ADC_Start(&hadc1);
-    HAL_ADC_PollForConversion(&hadc1, HAL_MAX_DELAY);
-    uint32_t value = HAL_ADC_GetValue(&hadc1);
-    HAL_ADC_Stop(&hadc1);
-
-    return value;
-}
 
 /* Takes OVERSAMPLE_COUNT raw samples, insertion-sorts them and averages the
  * centre 6 of 8 (discarding the highest and lowest as outliers) - the same
@@ -45,7 +28,7 @@ static float ReadFilteredCounts(void)
     float sum = 0.0f;
 
     for (i = 0; i < (int)OVERSAMPLE_COUNT; i++)
-        samples[i] = ReadCurrentAdcBlocking();
+        samples[i] = AdcReader_ReadBlocking(ADC_READER_CH_CURRENT);
 
     for (i = 1; i < (int)OVERSAMPLE_COUNT; i++)
     {
