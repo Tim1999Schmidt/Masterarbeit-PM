@@ -43,8 +43,17 @@ typedef enum
     PID_ERROR_NONE = 0,
     PID_ERROR_STARTUP_OVERCURRENT = 1, /* short-circuit-like current already at the initial test duty cycle */
     PID_ERROR_RUNTIME_OVERCURRENT = 2, /* current exceeded the configured limit during normal operation */
-    PID_ERROR_SANITY = 3               /* temperature error grew implausibly (reversed polarity / instability) */
+    PID_ERROR_SANITY = 3,              /* temperature error grew implausibly (reversed polarity / instability) */
+    PID_ERROR_TEMP_SENSOR = 4,         /* PT1000 reading implausible (outside 0..70 degC, broken/shorted lead) */
+    PID_ERROR_EXT_TEMP_TIMEOUT = 5,    /* external temperature source: T_EXT not refreshed by the master in time */
+    PID_ERROR_OPEN_LOAD = 6            /* startup: (almost) no current at the test duty cycle - Peltier not connected */
 } PidControl_Error_t;
+
+/* Allowed ranges of the settable values (out-of-range values are clamped). */
+#define PID_TSET_MIN_DEGC     0.0f   /* = measuring range of the PT1000 front-end */
+#define PID_TSET_MAX_DEGC    70.0f
+#define PID_I_LIMIT_MIN_A     0.5f
+#define PID_I_LIMIT_MAX_A     5.0f   /* current measuring range is ~6.6 A (1 mOhm x 500), leaves room for the +0.5 A trip margin */
 
 typedef enum
 {
@@ -77,15 +86,17 @@ void PidControl_ClearError(void);
 uint8_t PidControl_IsError(void);
 PidControl_Error_t PidControl_GetErrorCode(void);
 
-/* Setpoint and gains. */
+/* Setpoint (clamped to PID_TSET_MIN/MAX_DEGC) and gains. */
 void PidControl_SetSetpoint(float tSetDegC);
 float PidControl_GetSetpoint(void);
 void PidControl_SetGains(float kp, float ki, float kd);
 void PidControl_GetGains(float *kp, float *ki, float *kd);
 
 /* Symmetric current limit magnitude, in amperes (replaces the original's
- * separate +/- currentLimitP/N now that current is single-ended). */
-void PidControl_SetCurrentLimit(float limitA);
+ * separate +/- currentLimitP/N now that current is single-ended). Clamped to
+ * PID_I_LIMIT_MIN/MAX_A. Only accepted while the driver is not running;
+ * returns 1 if applied, 0 if rejected. */
+uint8_t PidControl_SetCurrentLimit(float limitA);
 float PidControl_GetCurrentLimit(void);
 
 /* Live telemetry. */

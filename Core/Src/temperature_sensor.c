@@ -6,8 +6,9 @@
  * Note on the measuring range: the front-end maps 0 degC -> 0 V and 70 degC ->
  * 3.3 V. Below 0 degC / above ~70 degC the output saturates (and a broken
  * PT1000 lead makes the constant-current source drive the output to the top
- * rail, i.e. it looks like "70 degC"). This module does not (yet) flag such
- * readings; a plausibility check on the raw counts would be the place for it.
+ * rail, i.e. it looks like "70 degC"). Such readings are flagged by a
+ * plausibility check on the raw counts (TEMP_FAULT_LOW/HIGH_COUNTS), reported
+ * through TempSensor_GetFault(), and make the PID controller stop with an error.
  ******************************************************************************
  */
 #include "temperature_sensor.h"
@@ -29,6 +30,19 @@
 #define TEMP_OVERSAMPLE            16u     /* ADC conversions averaged per reading (one short burst) */
 #define CAL_OVERSAMPLE             64u     /* ADC conversions averaged per calibration resistor      */
 #define CAL_MIN_SPAN_COUNTS      1000.0f   /* plausibility: counts(1.27k) - counts(1k) must be at least this (nominal ~4084) */
+
+/* PT1000 plausibility: a reading this close to either ADC rail means the
+ * front-end is saturated (temperature outside 0..70 degC) or the sensor lead is
+ * broken / shorted. Must be seen on TEMP_FAULT_DEBOUNCE consecutive readings
+ * (= 300 ms) before it counts as a fault, so a single noisy reading does not stop the controller. */
+#define TEMP_FAULT_LOW_COUNTS       5.0f
+#define TEMP_FAULT_HIGH_COUNTS   4090.0f
+#define TEMP_FAULT_DEBOUNCE         3u
+
+/* External temperature (T_EXT via I2C): the value is only trusted if the master
+ * has written it within this time. Adjust to the master's actual update rate
+ * (with some margin). */
+#define EXT_TEMP_TIMEOUT_MS      2000u
 
 /* ReadAveragedCounts() drops the highest and the lowest sample, so it needs at least 3.
  * (Preprocessor check instead of C11 _Static_assert: the CubeIDE editor's parser flags
@@ -109,6 +123,10 @@ static uint32_t    lastTick = 0u;
 static uint8_t recalRequested   = 0u;
 static uint8_t calibrationOk    = 0u;
 static uint8_t measurementValid = 0u;
+static uint8_t newSample        = 0u;   /* set on every PT1000 reading (100 ms clock), consumed by the PID */
+
+static uint8_t pt1000FaultCount = 0u;
+static uint8_t pt1000Fault      = 0u;
 
 /* Raw counts measured on the two calibration resistors (diagnostics). */
 static float calCountsLow  = 0.0f;
@@ -127,6 +145,8 @@ static float trimSlope        = 0.0f;
 
 static TempSensor_Source_t controlSource = TEMP_SOURCE_INTERNAL;
 static float externalTemperatureC = 0.0f;
+static uint8_t  externalValid     = 0u;   /* 1 once the master has written T_EXT at least once */
+static uint32_t externalLastTick  = 0u;   /* HAL_GetTick() of the last T_EXT write */
 
 static void SetMapping(float countsLow, float countsHigh, float resLowOhm, float resHighOhm)
 {
@@ -158,6 +178,8 @@ static void BeginCalibration(void)
 {
     calibrationOk    = 0u;
     measurementValid = 0u;
+    pt1000FaultCount = 0u;
+    pt1000Fault      = 0u;
     SelectChannel(MUX_CAL_LOW);
     state = TS_CAL_MEASURE_LOW;
 }
@@ -186,6 +208,21 @@ static void MeasurePt1000(void)
     temperatureRawC = ResistanceToTemperature(resistanceOhm);
     temperatureC    = temperatureRawC - trimOffsetC - (temperatureRawC * trimSlope);
     measurementValid = 1u;
+    newSample        = 1u;
+
+    /* Plausibility check on the raw counts (see file header) */
+    if ((counts < TEMP_FAULT_LOW_COUNTS) || (counts > TEMP_FAULT_HIGH_COUNTS))
+    {
+        if (pt1000FaultCount < TEMP_FAULT_DEBOUNCE)
+            pt1000FaultCount++;
+        if (pt1000FaultCount >= TEMP_FAULT_DEBOUNCE)
+            pt1000Fault = 1u;
+    }
+    else
+    {
+        pt1000FaultCount = 0u;
+        pt1000Fault      = 0u;
+    }
 }
 
 /* ---- Public API ---------------------------------------------------------- */
@@ -253,9 +290,28 @@ void TempSensor_Recalibrate(void)
 uint8_t TempSensor_IsReady(void)
 {
     if (controlSource == TEMP_SOURCE_EXTERNAL)
-        return 1u;
+        return (TempSensor_GetFault() == TEMP_FAULT_NONE) ? 1u : 0u;
 
-    return (calibrationOk && measurementValid) ? 1u : 0u;
+    return (calibrationOk && measurementValid && !pt1000Fault) ? 1u : 0u;
+}
+
+TempSensor_Fault_t TempSensor_GetFault(void)
+{
+    if (controlSource == TEMP_SOURCE_EXTERNAL)
+    {
+        if (!externalValid || ((HAL_GetTick() - externalLastTick) > EXT_TEMP_TIMEOUT_MS))
+            return TEMP_FAULT_EXT_TIMEOUT;
+        return TEMP_FAULT_NONE;
+    }
+
+    return pt1000Fault ? TEMP_FAULT_PT1000_RANGE : TEMP_FAULT_NONE;
+}
+
+uint8_t TempSensor_ConsumeNewSample(void)
+{
+    const uint8_t flag = newSample;
+    newSample = 0u;
+    return flag;
 }
 
 float TempSensor_GetTemperature(void)
@@ -286,6 +342,8 @@ TempSensor_Source_t TempSensor_GetSource(void)
 void TempSensor_SetExternalTemperature(float tempDegC)
 {
     externalTemperatureC = tempDegC;
+    externalLastTick     = HAL_GetTick();
+    externalValid        = 1u;
 }
 
 void TempSensor_SetTrim(float offsetDegC, float slope)

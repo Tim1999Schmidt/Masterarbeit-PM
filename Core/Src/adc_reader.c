@@ -40,6 +40,13 @@ static void SelectOnly(uint32_t channel)
     selectedChannel = channel;
 }
 
+void AdcReader_Init(void)
+{
+    /* Built-in offset calibration of the ADC. Must run while the ADC is
+     * disabled, i.e. after MX_ADC1_Init() and before the first conversion. */
+    (void)HAL_ADCEx_Calibration_Start(&hadc1);
+}
+
 uint32_t AdcReader_ReadBlocking(uint32_t adcChannel)
 {
     uint32_t value;

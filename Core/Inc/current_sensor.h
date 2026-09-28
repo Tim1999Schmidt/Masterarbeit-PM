@@ -45,6 +45,11 @@ float CurrentSensor_Read(void);
  * the driver is off) to track thermal drift of that offset. */
 void CurrentSensor_CalibrateZero(void);
 
+/* 1 if the most recent CurrentSensor_Read() was at the top of the ADC range:
+ * the real current is then above the measuring range (~6.6 A) and unknown.
+ * The driver treats this as overcurrent. */
+uint8_t CurrentSensor_IsSaturated(void);
+
 #ifdef __cplusplus
 }
 #endif

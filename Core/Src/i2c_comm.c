@@ -46,6 +46,7 @@ typedef struct __attribute__((packed))
 
 #define REG_MAP_SIZE      ((uint8_t)sizeof(RegisterMap_t))
 #define OFF_CONTROL       1u
+#define OFF_T_EXT         6u   /* T_EXT occupies offsets 6 and 7 */
 
 /* One bit per register offset that a master may write:
  * CONTROL(1), CHANNEL_SEL(3), T_SET/T_EXT(4..7), KP/KI/KD/I_LIMIT(0x10..0x17). */
@@ -83,6 +84,7 @@ static uint8_t  txSnapshot[REG_MAP_SIZE];    /* consistent copy of the map for t
 
 static volatile uint8_t pendingControlWrite = 0u;
 static volatile uint8_t pendingConfigWrite = 0u;
+static volatile uint8_t pendingTExtWrite = 0u;   /* T_EXT was written (refreshes the external-source timeout even if unchanged) */
 
 /* ---- helpers ---------------------------------------------------------------- */
 /* float -> register value: round to nearest and saturate (a plain cast would
@@ -122,6 +124,8 @@ static void FinishWriteTransaction(void)
             pendingControlWrite = 1u;
         if (mask & ~(1u << OFF_CONTROL))
             pendingConfigWrite = 1u;
+        if (mask & ((1u << OFF_T_EXT) | (1u << (OFF_T_EXT + 1u))))
+            pendingTExtWrite = 1u;
     }
 
     wrMask = 0u;
@@ -151,6 +155,7 @@ void I2cComm_Init(void)
     wrMask = 0u;
     pendingControlWrite = 0u;
     pendingConfigWrite = 0u;
+    pendingTExtWrite = 0u;
 
     /* MX_I2C1_Init() (CubeMX-generated) leaves OwnAddress1 at 0. Set the real
      * 7-bit address the same way HAL_I2C_Init() does: OA1 may only be written
@@ -170,7 +175,7 @@ void I2cComm_Init(void)
 void I2cComm_Update(void)
 {
     RegisterMap_t snap;
-    uint8_t doControl, doConfig;
+    uint8_t doControl, doConfig, doTExt;
 
     /* 1) Build the telemetry outside the critical section ... */
     const uint8_t status = (uint8_t)((PidControl_IsRunning() ? 0x01u : 0u) |
@@ -201,8 +206,10 @@ void I2cComm_Update(void)
 
     doControl = pendingControlWrite;
     doConfig  = pendingConfigWrite;
+    doTExt    = pendingTExtWrite;
     pendingControlWrite = 0u;
     pendingConfigWrite  = 0u;
+    pendingTExtWrite    = 0u;
     snap = regs;
     if (doControl)
         regs.control = 0u; /* command bits are self-clearing */
@@ -228,11 +235,6 @@ void I2cComm_Update(void)
             PidControl_SetSetpoint((float)snap.tSet / 100.0f);
             applied.tSet = snap.tSet;
         }
-        if (snap.tExt != applied.tExt)
-        {
-            TempSensor_SetExternalTemperature((float)snap.tExt / 100.0f);
-            applied.tExt = snap.tExt;
-        }
         if (snap.channelSel != applied.channelSel)
         {
             if (snap.channelSel <= (uint8_t)TEMP_SOURCE_INTERNAL)
@@ -248,9 +250,35 @@ void I2cComm_Update(void)
         }
         if (snap.iLimit != applied.iLimit)
         {
-            PidControl_SetCurrentLimit((float)snap.iLimit / 1000.0f);
+            (void)PidControl_SetCurrentLimit((float)snap.iLimit / 1000.0f); /* rejected while running */
             applied.iLimit = snap.iLimit;
         }
+
+        /* T_SET and I_LIMIT may have been clamped (T_SET 0..70 degC, I_LIMIT
+         * 0.5..5 A) or rejected (I_LIMIT while running): write the value that is
+         * really in effect back into the register map, so the master reads it.
+         * Only if the master has not written a newer value in the meantime. */
+        {
+            const int16_t  effTSet   = ToInt16(PidControl_GetSetpoint() * 100.0f);
+            const uint16_t effILimit = ToUint16(PidControl_GetCurrentLimit() * 1000.0f);
+
+            __disable_irq();
+            if (regs.tSet == snap.tSet)
+                regs.tSet = effTSet;
+            if (regs.iLimit == snap.iLimit)
+                regs.iLimit = effILimit;
+            __enable_irq();
+            applied.tSet   = effTSet;
+            applied.iLimit = effILimit;
+        }
+    }
+
+    /* T_EXT: applied on EVERY write, even with an unchanged value - each write
+     * refreshes the timeout of the external temperature source. */
+    if (doTExt)
+    {
+        TempSensor_SetExternalTemperature((float)snap.tExt / 100.0f);
+        applied.tExt = snap.tExt;
     }
 }
 

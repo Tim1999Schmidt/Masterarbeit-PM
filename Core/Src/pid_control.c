@@ -12,18 +12,21 @@ extern TIM_HandleTypeDef htim3; /* PWM_CTRL / TIM3_CH1, initialised by MX_TIM3_I
 
 /* ---- Tunables, carried over from the original driver (converted from its
  * 0.1ms-tick units to milliseconds since HAL_GetTick() is now the timebase) */
-#define PID_FREQ_HZ                    10.0f  /* PID calculation rate */
-#define PID_CYCLE_MS                  100u    /* = 1000 / PID_FREQ_HZ */
+#define PID_FREQ_HZ                    10.0f  /* PID calculation rate: one calculation per new temperature
+                                               * sample, i.e. 1000 / TEMP_SAMPLE_INTERVAL_MS (temperature_sensor.c) */
 #define RELAY_ACTUATION_MS             50u    /* time to energise the bistable relay coil */
 #define CURRENT_CYCLE_MS               10u    /* actuation stage update rate */
 #define CURRENT_UPDATE_COOLDOWN_MS     20u    /* settle time after a new control value before overcurrent checks resume */
 #define RECAL_COOLDOWN_MS              20u    /* settle time after a duty-cycle recalibration */
 #define FLIP_TIME_MS                 1000u    /* minimum time direction must be requested before the relay actually flips */
 
-#define PWM_MAX_COUNT                65535u   /* matches htim3 ARR (Period = 65535, fixed by PM.ioc) */
+/* PWM resolution is taken from the timer itself (ARR + 1 counts per period, set
+ * by the TIM3 Counter Period in PM.ioc), so it stays correct if the PWM frequency
+ * is changed there. 100 % duty = CCR = ARR + 1 (PWM mode 1, up-counting). */
 
 #define DUTY_CYCLE_START                0.2f  /* initial test duty cycle for the startup short-circuit check */
 #define CURRENT_LIMIT_START_A           3.0f  /* fixed startup short-circuit threshold, independent of the user-settable run-time limit */
+#define OPEN_LOAD_MIN_CURRENT_A         0.1f  /* startup: less than this at DUTY_CYCLE_START = no Peltier element connected / open circuit */
 #define I_SAT_P                         2.5f  /* integrator anti-windup, positive */
 #define I_SAT_N                        -2.5f  /* integrator anti-windup, negative */
 
@@ -47,7 +50,6 @@ static float pidOut = 0.0f;
 static float err = 0.0f, errStart = 0.0f;
 static float errHistory[11];
 static uint8_t tempUpdatedFlag = 0;
-static uint32_t pidLastTick = 0;
 static PidControl_Error_t lastError = PID_ERROR_NONE;
 
 /* ---- Driver / actuation state --------------------------------------------- */
@@ -81,7 +83,7 @@ static void BusyWaitMs(uint32_t ms)
 static void SetPwmDutyCycle(float dc)
 {
     if (dc <= dutyCycleLimit && dc >= 0.0f)
-        htim3.Instance->CCR1 = (uint32_t)(dc * (float)PWM_MAX_COUNT);
+        htim3.Instance->CCR1 = (uint32_t)(dc * (float)(htim3.Instance->ARR + 1u) + 0.5f);
 }
 
 static void SetRelayHeating(void)
@@ -150,7 +152,7 @@ static uint8_t RunStartupCalibration(void)
     BusyWaitMs(4);
 
     measuredCurrent = CurrentSensor_Read();
-    if (measuredCurrent > CURRENT_LIMIT_START_A)
+    if (measuredCurrent > CURRENT_LIMIT_START_A || CurrentSensor_IsSaturated())
     {
         HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);
         EnterDriverError(PID_ERROR_STARTUP_OVERCURRENT);
@@ -159,10 +161,19 @@ static uint8_t RunStartupCalibration(void)
 
     BusyWaitMs(4);
     measuredCurrent = CurrentSensor_Read();
-    if (measuredCurrent > CURRENT_LIMIT_START_A)
+    if (measuredCurrent > CURRENT_LIMIT_START_A || CurrentSensor_IsSaturated())
     {
         HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);
         EnterDriverError(PID_ERROR_STARTUP_OVERCURRENT);
+        return 0;
+    }
+    if (measuredCurrent < OPEN_LOAD_MIN_CURRENT_A)
+    {
+        /* (Practically) no current at the test duty cycle: Peltier element not
+         * connected or circuit open. Also protects the dutyCycleLimit calculation
+         * below from dividing by ~0. */
+        HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);
+        EnterDriverError(PID_ERROR_OPEN_LOAD);
         return 0;
     }
     currentMaxDC = measuredCurrent;
@@ -181,7 +192,7 @@ static uint8_t RunStartupCalibration(void)
     BusyWaitMs(8);
     currentMaxDC = CurrentSensor_Read();
 
-    if (currentMaxDC > (currentLimit + 0.5f))
+    if (currentMaxDC > (currentLimit + 0.5f) || CurrentSensor_IsSaturated())
     {
         HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);
         EnterDriverError(PID_ERROR_STARTUP_OVERCURRENT);
@@ -244,12 +255,27 @@ static void DriverStep(void)
             break;
         driverLastTick = HAL_GetTick();
 
+        /* ADC at full scale: the real current is unknown (above the measuring
+         * range), so treat it as overcurrent right away, independent of the
+         * settling counters below. */
+        if (CurrentSensor_IsSaturated())
+        {
+            EnterDriverError(PID_ERROR_RUNTIME_OVERCURRENT);
+            break;
+        }
+
         if (relayActuatedCooldownCounter > 0)
             relayActuatedCooldownCounter--;
         else
             ReleaseRelayCoils();
 
-        controlDirection = (pidOut > 0.0f) ? PID_DIRECTION_HEATING : PID_DIRECTION_COOLING;
+        /* pidOut == 0 (e.g. right after start) keeps the current relay position */
+        if (pidOut > 0.0f)
+            controlDirection = PID_DIRECTION_HEATING;
+        else if (pidOut < 0.0f)
+            controlDirection = PID_DIRECTION_COOLING;
+        else
+            controlDirection = driverDirection;
 
         if (driverDirection != controlDirection)
         {
@@ -390,8 +416,13 @@ static void PidStep(void)
     switch (pidState)
     {
     case PID_STATE_OFF:
-        PushErrHistory();
-        err = T_SET - TempSensor_GetControlTemperature();
+        /* Keep the error history up to date on the measurement clock, so the
+         * derivative filter has correctly spaced samples right from the start. */
+        if (TempSensor_ConsumeNewSample())
+        {
+            PushErrHistory();
+            err = T_SET - TempSensor_GetControlTemperature();
+        }
 
         /* A start request waits until the temperature measurement is valid
          * (calibration of the analog front-end right after boot takes ~300 ms),
@@ -401,6 +432,8 @@ static void PidStep(void)
             startRequested = 0;
             errStart = err;
             tempUpdatedFlag = 0;
+            pidOut = 0.0f;          /* no stale output from a previous run */
+            P_val = I_val = D_val = 0.0f;
             driverStartRequested = 1;
             pidState = PID_STATE_WAIT_FOR_DRIVER;
         }
@@ -410,7 +443,8 @@ static void PidStep(void)
         if (driverState == DRIVER_STATE_ON)
         {
             P_val = I_val = D_val = 0.0f;
-            pidLastTick = HAL_GetTick();
+            pidOut = 0.0f;
+            (void)TempSensor_ConsumeNewSample(); /* first calculation on a sample taken after the (blocking) driver start */
             pidState = PID_STATE_WAIT;
         }
         else if (driverState == DRIVER_STATE_ERROR)
@@ -420,11 +454,9 @@ static void PidStep(void)
         break;
 
     case PID_STATE_WAIT:
-        if ((HAL_GetTick() - pidLastTick) >= PID_CYCLE_MS)
-        {
-            pidLastTick = HAL_GetTick();
+        /* One PID calculation per new temperature sample (100 ms measurement clock) */
+        if (TempSensor_ConsumeNewSample())
             pidState = PID_STATE_CALCULATE;
-        }
         break;
 
     case PID_STATE_CALCULATE:
@@ -432,6 +464,18 @@ static void PidStep(void)
         {
             pidState = PID_STATE_OFF;
             break;
+        }
+
+        /* Temperature not trustworthy (PT1000 at an ADC rail / T_EXT timed out):
+         * stop regulating - the driver follows into its error state. */
+        {
+            const TempSensor_Fault_t fault = TempSensor_GetFault();
+            if (fault != TEMP_FAULT_NONE)
+            {
+                lastError = (fault == TEMP_FAULT_EXT_TIMEOUT) ? PID_ERROR_EXT_TEMP_TIMEOUT : PID_ERROR_TEMP_SENSOR;
+                pidState = PID_STATE_ERROR;
+                break;
+            }
         }
 
         PushErrHistory();
@@ -537,6 +581,9 @@ PidControl_Error_t PidControl_GetErrorCode(void)
 
 void PidControl_SetSetpoint(float tSetDegC)
 {
+    /* Limited to the measuring range of the PT1000 front-end */
+    if (tSetDegC < PID_TSET_MIN_DEGC) tSetDegC = PID_TSET_MIN_DEGC;
+    if (tSetDegC > PID_TSET_MAX_DEGC) tSetDegC = PID_TSET_MAX_DEGC;
     T_SET = tSetDegC;
     tempUpdatedFlag = 1;
 }
@@ -557,9 +604,18 @@ void PidControl_GetGains(float *outKp, float *outKi, float *outKd)
     if (outKd) *outKd = kd;
 }
 
-void PidControl_SetCurrentLimit(float limitA)
+uint8_t PidControl_SetCurrentLimit(float limitA)
 {
-    currentLimit = (limitA < 0.0f) ? -limitA : limitA;
+    /* Only while the driver is not running: dutyCycleLimit is calibrated for the
+     * limit at start (RunStartupCalibration), a change during operation would
+     * either trip the overcurrent check or not be reachable. */
+    if (driverState == DRIVER_STATE_ON)
+        return 0u;
+
+    if (limitA < PID_I_LIMIT_MIN_A) limitA = PID_I_LIMIT_MIN_A;
+    if (limitA > PID_I_LIMIT_MAX_A) limitA = PID_I_LIMIT_MAX_A;
+    currentLimit = limitA;
+    return 1u;
 }
 
 float PidControl_GetCurrentLimit(void) { return currentLimit; }

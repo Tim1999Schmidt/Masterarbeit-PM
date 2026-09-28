@@ -28,14 +28,18 @@
  *
  *   Addr  Name        R/W  Type    Scale / meaning
  *   0x00  STATUS       RO  uint8   bit0 running, bit1 error, bit2 direction (0=heating,1=cooling),
- *                                  bit3 temperature valid (see TempSensor_IsReady)
+ *                                  bit3 temperature valid (see TempSensor_IsReady: calibrated and
+ *                                  plausible for the PT1000, refreshed in time for T_EXT)
  *   0x01  CONTROL      RW  uint8   write: bit0=start, bit1=stop, bit2=clear error,
  *                                  bit3=recalibrate temperature front-end (only while not running)
  *                                  (self-clearing, reads back 0)
- *   0x02  ERROR_CODE   RO  uint8   0 none, 1 startup overcurrent, 2 runtime overcurrent, 3 sanity error
+ *   0x02  ERROR_CODE   RO  uint8   0 none, 1 startup overcurrent, 2 runtime overcurrent, 3 sanity error,
+ *                                  4 PT1000 implausible, 5 T_EXT timeout, 6 open load (no Peltier)
  *   0x03  CHANNEL_SEL  RW  uint8   temperature source for the PID: 0 = external (T_EXT), 1 = PT1000 (CH1)
- *   0x04  T_SET        RW  int16   deg C x100
- *   0x06  T_EXT        RW  int16   deg C x100 (used while CHANNEL_SEL = 0)
+ *   0x04  T_SET        RW  int16   deg C x100, clamped to 0..7000 (0..70 degC; reads back the value in effect)
+ *   0x06  T_EXT        RW  int16   deg C x100 (used while CHANNEL_SEL = 0). Must be rewritten
+ *                                  periodically (also if unchanged): not written for
+ *                                  EXT_TEMP_TIMEOUT_MS (temperature_sensor.c, 2 s) -> error 5
  *   0x08  T_ACTUAL     RO  int16   deg C x100 (value currently feeding the PID)
  *   0x0A  T_PT1000     RO  int16   deg C x100 (PT1000 on CH1, independent of CHANNEL_SEL)
  *   0x0C  CAL_LOW      RO  uint16  raw ADC counts measured on the 1.00 kOhm reference (bring-up diagnostics)
@@ -43,7 +47,8 @@
  *   0x10  KP           RW  uint16  x1000
  *   0x12  KI           RW  uint16  x1000
  *   0x14  KD           RW  uint16  x1000
- *   0x16  I_LIMIT      RW  uint16  mA
+ *   0x16  I_LIMIT      RW  uint16  mA, clamped to 500..5000; only accepted while not running
+ *                                  (reads back the value in effect)
  *   0x18  I_ACTUAL     RO  uint16  mA (always >= 0, see current_sensor.h)
  *   0x1A  DUTY_CYCLE   RO  uint16  x1000 (0..1000 = 0..100.0%)
  *

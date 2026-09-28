@@ -28,6 +28,10 @@ extern "C" {
 #define ADC_READER_CH_TEMP      ADC_CHANNEL_1   /* TEMP        (PA1) */
 #define ADC_READER_CH_CURRENT   ADC_CHANNEL_2   /* I_SENS_FILT (PA2) */
 
+/* Runs the ADC self-calibration. Call once from main() after MX_ADC1_Init()
+ * and before TempSensor_Init()/CurrentSensor_Init() (i.e. before any conversion). */
+void AdcReader_Init(void);
+
 /* Returns the raw 12-bit result (0..4095) of one conversion of adcChannel.
  * Call from the main loop only (not from interrupts). */
 uint32_t AdcReader_ReadBlocking(uint32_t adcChannel);

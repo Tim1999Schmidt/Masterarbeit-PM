@@ -65,6 +65,14 @@ typedef enum
     TEMP_SOURCE_INTERNAL = 1   /* the PT1000 on CH1 */
 } TempSensor_Source_t;
 
+/* Problems with the temperature the PID controller regulates on. */
+typedef enum
+{
+    TEMP_FAULT_NONE = 0,
+    TEMP_FAULT_PT1000_RANGE,   /* internal source: PT1000 reading at an ADC rail (outside 0..70 degC, broken/shorted lead) */
+    TEMP_FAULT_EXT_TIMEOUT     /* external source: T_EXT never written or not refreshed within EXT_TEMP_TIMEOUT_MS */
+} TempSensor_Fault_t;
+
 /* One-time setup; starts the calibration sequence. Call from main() before the main loop. */
 void TempSensor_Init(void);
 
@@ -77,9 +85,20 @@ void TempSensor_Process(void);
 void TempSensor_Recalibrate(void);
 
 /* 1 once the temperature the controller uses is valid: with the internal
- * source that means "calibration succeeded and a first PT1000 value exists";
- * with the external source it is always 1. */
+ * source that means "calibration succeeded, a first PT1000 value exists and it
+ * is plausible"; with the external source it means "T_EXT was written within
+ * EXT_TEMP_TIMEOUT_MS". */
 uint8_t TempSensor_IsReady(void);
+
+/* Current fault of the temperature the controller uses (see TempSensor_Fault_t).
+ * Checked by the PID controller on every cycle while regulating. */
+TempSensor_Fault_t TempSensor_GetFault(void);
+
+/* Returns 1 (once) for every new PT1000 reading, i.e. on the fixed 100 ms
+ * measurement clock. The PID controller runs one calculation per new sample,
+ * so its cycle is locked to the measurement (also with the external source,
+ * which then simply supplies the most recent T_EXT). */
+uint8_t TempSensor_ConsumeNewSample(void);
 
 /* PT1000 (CH1) results. */
 float TempSensor_GetTemperature(void);   /* degC, including the optional trim */
@@ -89,6 +108,8 @@ float TempSensor_GetResistance(void);    /* Ohm */
 float TempSensor_GetControlTemperature(void);
 void  TempSensor_SetSource(TempSensor_Source_t source);
 TempSensor_Source_t TempSensor_GetSource(void);
+/* Call on EVERY master write of T_EXT (even with an unchanged value): it also
+ * refreshes the timeout of the external source. */
 void  TempSensor_SetExternalTemperature(float tempDegC);
 
 /* Optional final trim against a reference thermometer (e.g. to remove the
