@@ -56,8 +56,8 @@ typedef enum { DRIVER_STATE_OFF, DRIVER_STATE_ON, DRIVER_STATE_ERROR } DriverSta
 static DriverState_t driverState = DRIVER_STATE_OFF;
 static uint8_t driverStartRequested = 0;
 static uint8_t driverStopRequested = 0;
-static float driverDirection = 1.0f;   /* +1 = heating (RELAY_SET), -1 = cooling (RELAY_RESET) */
-static float controlDirection = 1.0f;
+static PidControl_Direction_t driverDirection  = PID_DIRECTION_HEATING; /* HEATING = RELAY_SET, COOLING = RELAY_RESET */
+static PidControl_Direction_t controlDirection = PID_DIRECTION_HEATING;
 static uint8_t directionFlipCounter = 0;
 static uint8_t directionFlipThreshold = 1; /* recomputed in Init */
 static float currentLimit = 2.0f;          /* symmetric magnitude, I2C-settable */
@@ -129,7 +129,7 @@ static void EnterDriverError(PidControl_Error_t reason)
  * see the design note in pid_control.h for why that is fine here. */
 static uint8_t RunStartupCalibration(void)
 {
-    driverDirection = 1.0f;
+    driverDirection = PID_DIRECTION_HEATING;
     SetRelayHeating();
     BusyWaitMs(RELAY_ACTUATION_MS);
     ReleaseRelayCoils();
@@ -227,7 +227,7 @@ static void DriverStep(void)
             HAL_GPIO_WritePin(PID_HEATING_GPIO_Port, PID_HEATING_Pin, GPIO_PIN_RESET);
             BusyWaitMs(4); /* let current settle to zero before the relay is allowed to switch */
             SetRelayHeating(); /* leave relay in a defined (heating) position, mirrors original driver */
-            driverDirection = 1.0f;
+            driverDirection = PID_DIRECTION_HEATING;
             BusyWaitMs(RELAY_ACTUATION_MS);
             ReleaseRelayCoils();
             driverState = DRIVER_STATE_OFF;
@@ -249,9 +249,9 @@ static void DriverStep(void)
         else
             ReleaseRelayCoils();
 
-        controlDirection = (pidOut > 0.0f) ? 1.0f : -1.0f;
+        controlDirection = (pidOut > 0.0f) ? PID_DIRECTION_HEATING : PID_DIRECTION_COOLING;
 
-        if (driverDirection * controlDirection < 0.0f)
+        if (driverDirection != controlDirection)
         {
             /* Desired direction differs from the actuated one: hold at zero and
              * only actually flip the relay once the request is stable for
@@ -262,7 +262,7 @@ static void DriverStep(void)
             if (directionFlipCounter > directionFlipThreshold)
             {
                 driverDirection = controlDirection;
-                if (driverDirection < 0.0f)
+                if (driverDirection == PID_DIRECTION_COOLING)
                     SetRelayCooling();
                 else
                     SetRelayHeating();
@@ -330,7 +330,7 @@ static void DriverStep(void)
             }
 
             currentControl = pidOut;
-            if (driverDirection > 0.0f)
+            if (driverDirection == PID_DIRECTION_HEATING)
             {
                 if (currentControl > currentLimit) currentControl = currentLimit;
                 if (currentControl < 0.0f) currentControl = 0.0f;
@@ -570,5 +570,5 @@ float PidControl_GetDutyCycle(void) { return dutyCycle; }
 
 PidControl_Direction_t PidControl_GetDirection(void)
 {
-    return (driverDirection < 0.0f) ? PID_DIRECTION_COOLING : PID_DIRECTION_HEATING;
+    return driverDirection;
 }
